@@ -1,0 +1,9 @@
+# Local runtime and Maven caches
+.codex-temp/
+.maven-cache/
+/target/
+
+# Local tracker data and generated logs
+*.xlsx
+*.xls
+utility_*.log
