@@ -1,5 +1,7 @@
 package com.example.utilityAutomation;
 
+import com.example.utilityAutomation.dto.LocalRunRequest;
+import com.example.utilityAutomation.dto.RunResponse;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -39,66 +41,129 @@ public class ExcelReaderService {
     private static final String DEFAULT_DEVELOPER_TRACKER_PATH =
             "C:\\Projects\\boral\\Boral_Retrofitment\\Utility\\Final_Utility_28-02-2025\\Boral_RICE_CEMLI_Tracker_V3.xlsx";
 
-    private static final String MASTER_SHEET_DB_OBJECTS = "DB Objects";
-    private static final String TRACKER_SHEET_NAME = "Tracker";
+    private static final String DEFAULT_MASTER_SHEET_NAME = "DB Objects";
+    private static final String DEFAULT_TRACKER_SHEET_NAME = "Tracker";
+    private static final String DEFAULT_IDENTIFIED_BY = "UTILITY";
+    private static final String DEFAULT_DATE_FORMAT = "dd-MMM-yyyy";
 
-    private static final Set<String> UTILITY_OBJECT_TYPES = new HashSet<String>(Arrays.asList(
+    private static final Set<String> DEFAULT_ALLOWED_OBJECT_TYPES = new HashSet<String>(Arrays.asList(
             "PACKAGE", "PACKAGE BODY", "PROCEDURE", "VIEW"
     ));
 
-    private static final String IDENTIFIED_BY_UTILITY = "UTILITY";
     private static final DataFormatter DATA_FORMATTER = new DataFormatter();
 
     public void readDBObjectsSheet() {
-        IOUtils.setByteArrayMaxOverride(350_000_000);
+        LocalRunRequest request = new LocalRunRequest();
+        request.masterPath = System.getProperty("utility.master.path", DEFAULT_MASTER_TRACKER_PATH);
+        request.trackerPath = System.getProperty("utility.tracker.path", DEFAULT_DEVELOPER_TRACKER_PATH);
+        request.masterSheetName = System.getProperty("utility.master.sheet", DEFAULT_MASTER_SHEET_NAME);
+        request.trackerSheetName = System.getProperty("utility.tracker.sheet", DEFAULT_TRACKER_SHEET_NAME);
+        request.identifiedBy = System.getProperty("utility.identifiedBy", DEFAULT_IDENTIFIED_BY);
+        request.dateFormat = System.getProperty("utility.dateFormat", DEFAULT_DATE_FORMAT);
+        request.fallbackObjectNameOnly = Boolean.parseBoolean(System.getProperty("utility.fallbackObjectNameOnly", "true"));
 
-        String masterTrackerPath = System.getProperty("utility.master.path", DEFAULT_MASTER_TRACKER_PATH);
-        String developerTrackerPath = System.getProperty("utility.tracker.path", DEFAULT_DEVELOPER_TRACKER_PATH);
-
-        File masterFile = new File(masterTrackerPath);
-        File trackerFile = new File(developerTrackerPath);
-
-        if (!masterFile.exists()) {
-            System.err.println("ERROR: Master tracker not found at: " + masterFile.getAbsolutePath());
+        RunResponse response = runLocal(request);
+        if (!response.success) {
+            System.err.println("ERROR: " + response.message);
             return;
         }
 
-        if (!trackerFile.exists()) {
-            System.err.println("ERROR: Developer tracker not found at: " + trackerFile.getAbsolutePath());
-            return;
+        System.out.println(response.message);
+        System.out.println("Rows updated: " + response.updatedRows);
+        System.out.println("Rows skipped (no comment found): " + response.skippedNoCommentRows);
+        System.out.println("Rows skipped (filters): " + response.skippedFilteredRows);
+        if (!isBlank(response.missedLogFilePath)) {
+            System.out.println("Missed objects log: " + response.missedLogFilePath);
         }
-
-        try {
-            Map<ObjectKey, String> commentsByObjectAndType = buildUtilityComments(masterFile);
-            if (commentsByObjectAndType.isEmpty()) {
-                System.out.println("No utility comments generated from master tracker.");
-                return;
-            }
-
-            TrackerUpdateStats stats = updateTrackerOracleComments(trackerFile, commentsByObjectAndType);
-
-            System.out.println("Utility comments update completed.");
-            System.out.println("Rows updated: " + stats.updatedRows);
-            System.out.println("Rows skipped (no comment found): " + stats.skippedNoCommentRows);
-            System.out.println("Rows skipped (filters): " + stats.skippedFilteredRows);
-            if (!isBlank(stats.missedLogFilePath)) {
-                System.out.println("Missed objects log: " + stats.missedLogFilePath);
-            }
-
-        } catch (Exception e) {
-            System.err.println("ERROR while updating utility comments: " + e.getMessage());
-            e.printStackTrace();
+        if (!isBlank(response.runSummaryFilePath)) {
+            System.out.println("Run summary log: " + response.runSummaryFilePath);
         }
     }
 
-    private Map<ObjectKey, String> buildUtilityComments(File masterFile) throws IOException {
+    public RunResponse runLocal(LocalRunRequest request) {
+        IOUtils.setByteArrayMaxOverride(350_000_000);
+
+        EffectiveConfig config = buildConfig(request);
+
+        File masterFile = new File(config.masterPath);
+        File trackerSourceFile = new File(config.trackerPath);
+        File trackerOutputFile = isBlank(config.outputTrackerPath)
+                ? trackerSourceFile
+                : new File(config.outputTrackerPath);
+
+        if (!masterFile.exists()) {
+            return RunResponse.failure("Master tracker not found at: " + masterFile.getAbsolutePath());
+        }
+
+        if (!trackerSourceFile.exists()) {
+            return RunResponse.failure("Tracker file not found at: " + trackerSourceFile.getAbsolutePath());
+        }
+
+        if (trackerOutputFile.getParentFile() != null && !trackerOutputFile.getParentFile().exists()) {
+            trackerOutputFile.getParentFile().mkdirs();
+        }
+
+        File logDir = isBlank(config.outputDir)
+                ? trackerOutputFile.getParentFile()
+                : new File(config.outputDir);
+        if (logDir == null) {
+            logDir = new File(".");
+        }
+        if (logDir != null && !logDir.exists()) {
+            logDir.mkdirs();
+        }
+
+        try {
+            Map<ObjectKey, String> commentsByObjectAndType = buildUtilityComments(masterFile, config);
+            if (commentsByObjectAndType.isEmpty()) {
+                return RunResponse.failure("No utility comments generated from master tracker.");
+            }
+
+            TrackerUpdateStats stats = updateTrackerOracleComments(trackerSourceFile, trackerOutputFile, logDir, commentsByObjectAndType, config);
+
+            RunResponse response = RunResponse.success("Utility comments update completed.");
+            response.updatedRows = stats.updatedRows;
+            response.skippedNoCommentRows = stats.skippedNoCommentRows;
+            response.skippedFilteredRows = stats.skippedFilteredRows;
+            response.trackerOutputPath = trackerOutputFile.getAbsolutePath();
+            response.missedLogFilePath = stats.missedLogFilePath;
+            response.runSummaryFilePath = stats.runSummaryFilePath;
+            return response;
+        } catch (Exception e) {
+            return RunResponse.failure("Processing failed: " + e.getMessage());
+        }
+    }
+
+    private EffectiveConfig buildConfig(LocalRunRequest request) {
+        EffectiveConfig cfg = new EffectiveConfig();
+        cfg.masterPath = valueOrDefault(request.masterPath, DEFAULT_MASTER_TRACKER_PATH);
+        cfg.trackerPath = valueOrDefault(request.trackerPath, DEFAULT_DEVELOPER_TRACKER_PATH);
+        cfg.outputTrackerPath = valueOrDefault(request.outputTrackerPath, "");
+        cfg.masterSheetName = valueOrDefault(request.masterSheetName, "auto");
+        cfg.trackerSheetName = valueOrDefault(request.trackerSheetName, "auto");
+        cfg.identifiedBy = normalizeToken(valueOrDefault(request.identifiedBy, DEFAULT_IDENTIFIED_BY));
+        cfg.dateFormat = valueOrDefault(request.dateFormat, DEFAULT_DATE_FORMAT);
+        cfg.fallbackObjectNameOnly = request.fallbackObjectNameOnly;
+        cfg.outputDir = valueOrDefault(request.outputDir, "");
+
+        Set<String> allowed = new HashSet<String>();
+        if (request.allowedObjectTypes != null && !request.allowedObjectTypes.isEmpty()) {
+            for (String s : request.allowedObjectTypes) {
+                if (!isBlank(s)) {
+                    allowed.add(normalizeObjectType(s));
+                }
+            }
+        }
+        if (allowed.isEmpty()) {
+            allowed.addAll(DEFAULT_ALLOWED_OBJECT_TYPES);
+        }
+        cfg.allowedObjectTypes = allowed;
+        return cfg;
+    }
+
+    private Map<ObjectKey, String> buildUtilityComments(File masterFile, EffectiveConfig config) throws IOException {
         try (FileInputStream fis = new FileInputStream(masterFile);
              Workbook workbook = new XSSFWorkbook(fis)) {
-
-            Sheet sheet = workbook.getSheet(MASTER_SHEET_DB_OBJECTS);
-            if (sheet == null) {
-                throw new IllegalStateException("Sheet not found in master tracker: " + MASTER_SHEET_DB_OBJECTS);
-            }
 
             Set<String> requiredHeaders = new HashSet<String>(Arrays.asList(
                     "OBJECT_NAME",
@@ -109,10 +174,13 @@ public class ExcelReaderService {
                     "ADDITIONAL_INFO1_1"
             ));
 
-            HeaderInfo headerInfo = detectHeader(sheet, requiredHeaders);
-            if (headerInfo == null) {
-                throw new IllegalStateException("Required headers not found in master tracker sheet: " + MASTER_SHEET_DB_OBJECTS);
+            SheetSelection selection = findSheetWithHeaders(workbook, config.masterSheetName, requiredHeaders);
+            if (selection == null) {
+                throw new IllegalStateException("Required headers not found in master workbook.");
             }
+
+            Sheet sheet = selection.sheet;
+            HeaderInfo headerInfo = selection.headerInfo;
 
             Map<ObjectKey, Map<String, LinkedHashSet<String>>> groupedChanges = new LinkedHashMap<ObjectKey, Map<String, LinkedHashSet<String>>>();
 
@@ -133,7 +201,7 @@ public class ExcelReaderService {
                     continue;
                 }
 
-                if (!UTILITY_OBJECT_TYPES.contains(objectType)) {
+                if (!config.allowedObjectTypes.contains(objectType)) {
                     continue;
                 }
 
@@ -157,7 +225,7 @@ public class ExcelReaderService {
                 groupedChanges.get(key).get(category).add(value);
             }
 
-            SimpleDateFormat sdf = new SimpleDateFormat("dd-MMM-yyyy", Locale.ENGLISH);
+            SimpleDateFormat sdf = new SimpleDateFormat(config.dateFormat, Locale.ENGLISH);
             String currentDate = sdf.format(new Date());
 
             Map<ObjectKey, String> finalComments = new HashMap<ObjectKey, String>();
@@ -169,16 +237,14 @@ public class ExcelReaderService {
         }
     }
 
-    private TrackerUpdateStats updateTrackerOracleComments(File trackerFile,
-                                                           Map<ObjectKey, String> commentsByObjectAndType) throws IOException {
+    private TrackerUpdateStats updateTrackerOracleComments(File trackerSourceFile,
+                                                           File trackerOutputFile,
+                                                           File logDir,
+                                                           Map<ObjectKey, String> commentsByObjectAndType,
+                                                           EffectiveConfig config) throws IOException {
 
-        try (FileInputStream fis = new FileInputStream(trackerFile);
+        try (FileInputStream fis = new FileInputStream(trackerSourceFile);
              Workbook workbook = new XSSFWorkbook(fis)) {
-
-            Sheet trackerSheet = workbook.getSheet(TRACKER_SHEET_NAME);
-            if (trackerSheet == null) {
-                throw new IllegalStateException("Sheet not found in tracker: " + TRACKER_SHEET_NAME);
-            }
 
             Set<String> requiredHeaders = new HashSet<String>(Arrays.asList(
                     "OBJECT_NAME",
@@ -187,10 +253,13 @@ public class ExcelReaderService {
                     "ORACLE COMMENTS"
             ));
 
-            HeaderInfo headerInfo = detectHeader(trackerSheet, requiredHeaders);
-            if (headerInfo == null) {
-                throw new IllegalStateException("Required headers not found in tracker sheet: " + TRACKER_SHEET_NAME);
+            SheetSelection selection = findSheetWithHeaders(workbook, config.trackerSheetName, requiredHeaders);
+            if (selection == null) {
+                throw new IllegalStateException("Required headers not found in tracker workbook.");
             }
+
+            Sheet trackerSheet = selection.sheet;
+            HeaderInfo headerInfo = selection.headerInfo;
 
             int objectNameCol = headerInfo.columns.get("OBJECT_NAME").intValue();
             int objectTypeCol = headerInfo.columns.get("OBJECT TYPE").intValue();
@@ -210,8 +279,8 @@ public class ExcelReaderService {
                 String objectType = normalizeObjectType(getCellValue(row, Integer.valueOf(objectTypeCol)));
                 String objectName = normalizeToken(getCellValue(row, Integer.valueOf(objectNameCol)));
 
-                if (!IDENTIFIED_BY_UTILITY.equals(identifiedBy)
-                        || !UTILITY_OBJECT_TYPES.contains(objectType)
+                if (!config.identifiedBy.equals(identifiedBy)
+                        || !config.allowedObjectTypes.contains(objectType)
                         || isBlank(objectName)) {
                     stats.skippedFilteredRows++;
                     continue;
@@ -219,6 +288,10 @@ public class ExcelReaderService {
 
                 ObjectKey key = new ObjectKey(objectName, objectType);
                 String comment = commentsByObjectAndType.get(key);
+
+                if (isBlank(comment) && config.fallbackObjectNameOnly) {
+                    comment = findByObjectName(commentsByObjectAndType, objectName);
+                }
 
                 if (isBlank(comment)) {
                     stats.skippedNoCommentRows++;
@@ -231,29 +304,40 @@ public class ExcelReaderService {
                 stats.updatedRows++;
             }
 
-            try (FileOutputStream fos = new FileOutputStream(trackerFile)) {
+            try (FileOutputStream fos = new FileOutputStream(trackerOutputFile)) {
                 workbook.write(fos);
             }
-            stats.missedLogFilePath = writeMissedObjectsLog(trackerFile, missedObjects);
+
+            stats.missedLogFilePath = writeMissedObjectsLog(trackerOutputFile, logDir, missedObjects);
+            stats.runSummaryFilePath = writeRunSummary(logDir, trackerSourceFile, trackerOutputFile, selection.sheet.getSheetName(), stats, config);
 
             return stats;
         }
     }
 
-    private String writeMissedObjectsLog(File trackerFile, List<MissedObjectEntry> missedObjects) throws IOException {
+    private String findByObjectName(Map<ObjectKey, String> commentsByObjectAndType, String objectName) {
+        for (Map.Entry<ObjectKey, String> entry : commentsByObjectAndType.entrySet()) {
+            if (entry.getKey().objectName.equals(objectName)) {
+                return entry.getValue();
+            }
+        }
+        return "";
+    }
+
+    private String writeMissedObjectsLog(File trackerOutputFile, File logDir, List<MissedObjectEntry> missedObjects) throws IOException {
         if (missedObjects == null || missedObjects.isEmpty()) {
             return "";
         }
 
         String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ENGLISH).format(new Date());
-        File output = new File(trackerFile.getParentFile(), "utility_missed_objects_" + ts + ".log");
+        File output = new File(logDir, "utility_missed_objects_" + ts + ".log");
 
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(output))) {
             writer.write("Missed Utility Objects");
             writer.newLine();
             writer.write("Generated At: " + new SimpleDateFormat("dd-MMM-yyyy HH:mm:ss", Locale.ENGLISH).format(new Date()));
             writer.newLine();
-            writer.write("Tracker: " + trackerFile.getAbsolutePath());
+            writer.write("Tracker Output: " + trackerOutputFile.getAbsolutePath());
             writer.newLine();
             writer.newLine();
 
@@ -267,6 +351,71 @@ public class ExcelReaderService {
         }
 
         return output.getAbsolutePath();
+    }
+
+    private String writeRunSummary(File logDir,
+                                   File trackerSourceFile,
+                                   File trackerOutputFile,
+                                   String trackerSheetName,
+                                   TrackerUpdateStats stats,
+                                   EffectiveConfig config) throws IOException {
+        String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ENGLISH).format(new Date());
+        File output = new File(logDir, "utility_run_summary_" + ts + ".log");
+
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(output))) {
+            writer.write("Utility Automation Run Summary");
+            writer.newLine();
+            writer.write("Generated At: " + new SimpleDateFormat("dd-MMM-yyyy HH:mm:ss", Locale.ENGLISH).format(new Date()));
+            writer.newLine();
+            writer.write("Master Path: " + config.masterPath);
+            writer.newLine();
+            writer.write("Tracker Source Path: " + trackerSourceFile.getAbsolutePath());
+            writer.newLine();
+            writer.write("Tracker Output Path: " + trackerOutputFile.getAbsolutePath());
+            writer.newLine();
+            writer.write("Tracker Sheet Used: " + trackerSheetName);
+            writer.newLine();
+            writer.write("Identified By Filter: " + config.identifiedBy);
+            writer.newLine();
+            writer.write("Allowed Object Types: " + joinValues(config.allowedObjectTypes));
+            writer.newLine();
+            writer.write("Fallback Object Name Only: " + config.fallbackObjectNameOnly);
+            writer.newLine();
+            writer.newLine();
+            writer.write("Updated Rows: " + stats.updatedRows);
+            writer.newLine();
+            writer.write("Skipped (No Comment): " + stats.skippedNoCommentRows);
+            writer.newLine();
+            writer.write("Skipped (Filter): " + stats.skippedFilteredRows);
+            writer.newLine();
+            writer.write("Missed Log Path: " + valueOrDefault(stats.missedLogFilePath, "N/A"));
+            writer.newLine();
+        }
+
+        return output.getAbsolutePath();
+    }
+
+    private SheetSelection findSheetWithHeaders(Workbook workbook, String preferredSheetName, Set<String> requiredHeaders) {
+        if (!isBlank(preferredSheetName) && !"auto".equalsIgnoreCase(preferredSheetName)) {
+            Sheet preferred = workbook.getSheet(preferredSheetName);
+            if (preferred != null) {
+                HeaderInfo hi = detectHeader(preferred, requiredHeaders);
+                if (hi != null) {
+                    return new SheetSelection(preferred, hi);
+                }
+            }
+        }
+
+        int sheetCount = workbook.getNumberOfSheets();
+        for (int i = 0; i < sheetCount; i++) {
+            Sheet sheet = workbook.getSheetAt(i);
+            HeaderInfo hi = detectHeader(sheet, requiredHeaders);
+            if (hi != null) {
+                return new SheetSelection(sheet, hi);
+            }
+        }
+
+        return null;
     }
 
     private HeaderInfo detectHeader(Sheet sheet, Set<String> requiredHeaders) {
@@ -419,11 +568,9 @@ public class ExcelReaderService {
 
     private String normalizeObjectType(String objectType) {
         String normalized = normalizeToken(objectType).replaceAll("\\s+", " ");
-
         if (normalized.equals("PACKAGEBODY")) {
             return "PACKAGE BODY";
         }
-
         return normalized;
     }
 
@@ -444,6 +591,23 @@ public class ExcelReaderService {
         return value == null || value.trim().isEmpty();
     }
 
+    private String valueOrDefault(String value, String defaultValue) {
+        return isBlank(value) ? defaultValue : value;
+    }
+
+    private static class EffectiveConfig {
+        private String masterPath;
+        private String trackerPath;
+        private String outputTrackerPath;
+        private String masterSheetName;
+        private String trackerSheetName;
+        private String identifiedBy;
+        private Set<String> allowedObjectTypes;
+        private String dateFormat;
+        private boolean fallbackObjectNameOnly;
+        private String outputDir;
+    }
+
     private static class HeaderInfo {
         private final int rowIndex;
         private final Map<String, Integer> columns;
@@ -454,11 +618,22 @@ public class ExcelReaderService {
         }
     }
 
+    private static class SheetSelection {
+        private final Sheet sheet;
+        private final HeaderInfo headerInfo;
+
+        private SheetSelection(Sheet sheet, HeaderInfo headerInfo) {
+            this.sheet = sheet;
+            this.headerInfo = headerInfo;
+        }
+    }
+
     private static class TrackerUpdateStats {
         private int updatedRows;
         private int skippedNoCommentRows;
         private int skippedFilteredRows;
         private String missedLogFilePath;
+        private String runSummaryFilePath;
     }
 
     private static class MissedObjectEntry {
