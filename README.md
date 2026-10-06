@@ -12,12 +12,14 @@ The Maven project is in the [`utilityAutomation`](utilityAutomation/) folder. Sh
 
 ## Run locally
 
-Open the `utilityAutomation` folder as a Maven project in IntelliJ IDEA. Set **Project SDK** to JDK 21 and wait for Maven import to finish. Run the Maven goal `spring-boot:run`, or run this in a terminal from the repository root:
+Open the `utilityAutomation` folder as a Maven project in IntelliJ IDEA. Set **Project SDK** to JDK 21 and wait for Maven import to finish. Select **Utility Automation** in the run configuration dropdown at the top right, then click **Run**. This configuration runs the Maven goal `spring-boot:run`. Alternatively, run this in a terminal from the repository root:
 
 ```powershell
 cd utilityAutomation
 mvn spring-boot:run
 ```
+
+Stop the running app before starting it again; only one process can use port 8080. The Maven run configuration sets a project-local directory for JDK Unix-domain sockets, avoiding a Windows startup error from the system temporary directory.
 
 Open [http://localhost:8080](http://localhost:8080). The home page loads without Excel files. To process data, replace the example paths in **Master Tracker Path** and **Tracker Path** with real files on your computer. The sample Windows paths shown in the form are placeholders from the original project.
 
